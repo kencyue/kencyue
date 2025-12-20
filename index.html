@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Panasonic 空調 / 空氣品質 Modbus RTU 指令產生器</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background:#f0f4f8; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:16px; font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; color:#1f2a44; }
+    h1 { font-size:1.5rem; font-weight:700; margin-bottom:1rem; text-align:center; }
+    .card { width:100%; max-width:600px; background:#fff; border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,.08); padding:16px; margin-bottom:1rem; }
+    label { display:block; font-size:.9rem; font-weight:600; color:#4a5568; margin-bottom:6px; }
+    input[type="number"], input[type="text"], select, button { width:100%; padding:10px; border:1px solid #e2e8f0; border-radius:8px; font-size:.95rem; }
+    input[type="number"], input[type="text"], select { background:#fafafa; }
+    input:focus, select:focus { outline:none; border-color:#3b82f6; box-shadow:0 0 0 2px rgba(59,130,246,.2); background:#fff; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .output-field { position:relative; margin-bottom:12px; }
+    .output-field input { padding-right:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; background:#f7fafc; cursor:pointer; }
+    .output-field input.copied { background:#d1fae5; transition: background-color .3s; }
+    .btn { background:#3b82f6; color:#fff; border:none; cursor:pointer; font-weight:600; }
+    .btn:hover { background:#2563eb; }
+    .checkbox { display:flex; align-items:center; gap:8px; font-size:.9rem; color:#4a5568; }
+    .hr { height:1px; background:#e5e7eb; margin:12px 0; }
+    .tip { font-size:.8rem; color:#64748b; }
+    .pill { display:inline-block; background:#eef2ff; color:#3730a3; padding:2px 8px; border-radius:999px; font-size:.75rem; font-weight:700; }
+  </style>
+</head>
+<body>
+  <h1>Panasonic 空調 / 空氣品質 Modbus RTU 指令產生器</h1>
+
+  <!-- 基本設定 -->
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="device">設備</label>
+        <select id="device">
+          <option value="ac">空調 (A/C)</option>
+          <option value="aq">空質 (AQ Sensor/Purifier)</option>
+        </select>
+      </div>
+      <div>
+        <label for="slave">從站 ID</label>
+        <input id="slave" type="number" min="0" max="247" value="1" />
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div class="checkbox">
+        <input id="broadcast" type="checkbox" />
+        <label for="broadcast" style="margin:0">Broadcast 全體 (ID=0，<span class="pill">不回應</span>；僅寫入 FC05/06)</label>
+      </div>
+      <div>
+        <label for="fcView">功能碼</label>
+        <input id="fcView" type="text" readonly />
+      </div>
+    </div>
+    <div style="margin-top:8px;">
+      <label for="operation">操作</label>
+      <select id="operation"></select>
+    </div>
+    <div id="param-area" style="margin-top:6px;"></div>
+    <button id="gen" class="btn" style="margin-top:10px;">生成指令</button>
+    <div class="hr"></div>
+    <div class="tip">提示：讀取多筆時，<b>數量用十進位</b>（讀 10 筆填 <b>10</b>）。地址可用 <b>40001 / 30001 / 00001</b> 這種 1-based 寫法。</div>
+  </div>
+
+  <!-- 輸出區 -->
+  <div class="card">
+    <div class="output-field">
+      <label>RTU 幀 (HEX)</label>
+      <input id="rtu" type="text" readonly placeholder="按下『生成指令』後顯示" />
+    </div>
+    <div class="output-field">
+      <label>Modbus Monitor 命令</label>
+      <input id="mon" type="text" readonly placeholder="按下『生成指令』後顯示" />
+    </div>
+  </div>
+
+<script>
+// ========= 共同工具 =========
+function crc16(bytes){ let crc=0xFFFF; for(const b of bytes){ crc ^= b; for(let i=0;i<8;i++){ crc = (crc & 1) ? (crc>>1) ^ 0xA001 : (crc>>1); } } return crc; }
+const toHex = n => n.toString(16).toUpperCase().padStart(2,'0');
+function rtuAddrFromHuman(addr){ const a=parseInt(addr,10); if(a>=40001) return a-40001; if(a>=30001) return a-30001; if(a>=1) return a-1; return 0; }
+function monAddrFromHuman(addr){
+  const a = parseInt(addr,10);
+  if (a>=40001) return 400000 + (a-40001+1);   // Holding → 4xxxxx
+  if (a>=30001) return 300000 + (a-30001+1);   // Input   → 3xxxxx
+  if (a>=1)     return 100000 + a;             // Coils   → 1xxxxx
+  return a;
+}
+
+// ========= AC 定義（依你給的手冊） =========
+const AC = {
+  COILS: {
+    1:'電源控制', 2:'舒眠模式',3:'上下風向自動',4:'空氣清淨',5:'空氣偵測',6:'防霉',7:'自體淨',8:'ECONAVI 節能',9:'提示音',10:'濾網清洗通知',11:'RMC 控制',12:'左右風向自動'
+  },
+  REG_ENUMS: {
+    40001:{label:'運轉模式', map:{0:'冷氣',1:'除濕',2:'送風',3:'自動',4:'暖氣'}},
+    40002:{label:'風速', map:{0:'自動',1:'一段',2:'二段',3:'三段',4:'四段',5:'五段'}},
+    40003:{label:'上下風向段數', map:{0:'自動',1:'1',2:'2',3:'3',4:'4',5:'5'}},
+    40004:{label:'急速/靜音', map:{0:'正常',1:'急速',2:'靜音'}},
+    40005:{label:'溫度', range:[16,30]},
+    40006:{label:'定時開(分)', range:[0,1440]},
+    40007:{label:'定時關(分)', range:[0,1440]},
+    40008:{label:'用電量(讀/清除)', note:'讀=FC03；清除=寫 0'},
+    40009:{label:'左右風向段數', map:{0:'自動',1:'1',2:'2',3:'3',4:'4',5:'5',6:'6',7:'7'}},
+    40010:{label:'動向感應', map:{0:'關',1:'對人',2:'不對人',3:'自動'}},
+    40011:{label:'機體顯示', map:{0:'亮',1:'暗',2:'關 ECONAVI LED'}},
+  },
+  INPUTS: {
+    30001:'室內溫度',30002:'異常碼',30003:'室外溫度',30004:'室內機能力',30005:'室外機運轉電流',30006:'人不在時間(10分)'
+  },
+  limits:{ coilMax:12, holdingMax:40011, holdingMin:40001, inputMax:30006, inputMin:30001 }
+};
+
+// ========= AQ 定義（通用空氣品質/淨化器；若之後你有專屬手冊再換表） =========
+const AQ = {
+  COILS: { // 空質：只有 00001 電源
+    1: '電源控制'
+  },
+  REG_ENUMS: {
+    40001:{label:'電源開關', map:{0:'Power Off',1:'Power On'}},
+    40002:{label:'模式', map:{0:'連續除濕',1:'自動除濕',2:'防霉抑菌',3:'送風',4:'衣物乾燥',5:'保持乾燥',6:'濕度設定',7:'空氣清淨',8:'AI',9:'智慧節能',10:'快速除濕',11:'靜音送風',12:'烘鞋衣櫃'}},
+    40003:{label:'風量設定', map:{0:'自動',1:'Lo',2:'Mid',3:'Hi',4:'SLo',5:'SHi'}},
+    40004:{label:'濕度設定(%)', range:[30,80]},
+    40005:{label:'定時開(小時)', range:[0,24]},
+    40006:{label:'定時關(小時)', range:[0,24]},
+    40007:{label:'定時開 RealTime(分)', range:[0,65535]}, // 1~1440；65535(0xFFFF)=停止
+    40008:{label:'定時關 RealTime(分)', range:[0,65535]}, // 1~1440；65535(0xFFFF)=停止
+    40009:{label:'Nanoe 開關', map:{0:'Off',1:'On'}},
+    40010:{label:'音頻', map:{0:'Off',1:'2kHz',2:'4kHz'}},
+    40011:{label:'機體亮度', map:{0:'Off(預備)',1:'全亮',2:'亮',3:'微亮',4:'暗'}},
+    40012:{label:'濾網清潔', map:{0:'重置(寫0)'}}, // Read 0/1；Write 0 重置
+    40013:{label:'HEPA 濾網壽命復歸', map:{0:'重置(寫0)'}},
+    40014:{label:'活性碳濾網壽命復歸', map:{0:'重置(寫0)'}},
+    40015:{label:'用電量(讀/清除)', note:'讀=FC03；清除=寫0'},
+    40016:{label:'提示音', map:{0:'無聲',1:'有聲'}},
+    40017:{label:'RMC 控制', map:{0:'關閉',1:'開啟'}},
+  },
+  INPUTS: {
+    30001:'System Status Flag(b03:nanoe、b04:定時開、b05:定時關…)',
+    30002:'異常情報(HB:Lv / LB:代碼)',
+    30003:'忘關防止 0/1',
+    30004:'目前濕度 0~99%',
+    30100:'商品情報(HB:商品類別 / LB:System Model)',
+    30101:'版本情報'
+  },
+  limits:{ coilMax:1, holdingMax:40017, holdingMin:40001, inputMax:30101, inputMin:30001 }
+};
+
+// ========= 依設備建立操作 =========
+function buildOps(schema){
+  const {COILS, REG_ENUMS, INPUTS, limits} = schema;
+  const coilCount = limits.coilMax;
+  const ops = [
+    { id:'quick_on',  name:'快速：開機 (Coil 00001=1)', fc:5, coil:1, val:1 },
+    { id:'quick_off', name:'快速：關機 (Coil 00001=0)', fc:5, coil:1, val:0 },
+    { id:'read_hold', name:'讀取 Holding Registers (FC03)', fc:3, params:[
+        {key:'start', label:`起始地址 (${limits.holdingMin}~${limits.holdingMax})`, type:'number', min:limits.holdingMin, max:limits.holdingMax, value:limits.holdingMin},
+        {key:'count', label:'讀取筆數 (1~125)', type:'number', min:1, max:125, value:1},
+      ]},
+    { id:'read_input', name:'讀取 Input Registers (FC04)', fc:4, params:[
+        {key:'start', label:`起始地址 (${limits.inputMin}~${limits.inputMax})`, type:'number', min:limits.inputMin, max:limits.inputMax, value:limits.inputMin},
+        {key:'count', label:'讀取筆數 (1~125)', type:'number', min:1, max:125, value:1},
+      ]},
+    { id:'read_coil', name:'讀取 Coils (FC01)', fc:1, params:[
+        {key:'start', label:`起始地址 (00001~${String(coilCount).padStart(5,'0')})`, type:'number', min:1, max:coilCount, value:1},
+        {key:'count', label:'讀取點數 (1~2000)', type:'number', min:1, max:2000, value:8},
+      ]},
+    { id:'write_coil', name:'寫入單一 Coil (FC05)', fc:5, params:[
+        {key:'coil', label:'Coil 地址', type:'select', options:Object.entries(COILS).map(([k,v])=>({value:+k,label:`${String(+k).padStart(5,'0')} ${v}`}))},
+        {key:'val',  label:'數值', type:'select', options:[{value:1,label:'1 (ON)'},{value:0,label:'0 (OFF)'}]}
+      ]},
+    { id:'write_reg', name:'寫入單一 Register (FC06)', fc:6, params:[
+        {key:'reg', label:'寄存器地址', type:'select', options:Object.keys(REG_ENUMS).map(k=>({value:+k,label:`${k} ${REG_ENUMS[k].label}`}))},
+        {key:'val', label:'寫入值', type:'dynamic'}
+      ]},
+  ];
+
+  // 依 schema 追加快捷
+  if(schema===AC){
+    ops.push({ id:'read_energy',  name:'讀取用電量 (40008, FC03)', fc:3, fixed:{start:40008,count:1} });
+    ops.push({ id:'clear_energy', name:'清除用電量 (40008=0, FC06)', fc:6, fixed:{reg:40008,val:0} });
+  }
+  if(schema===AQ){
+    ops.push({ id:'read_air_basic', name:'讀空質基本組(30001~30006) ×6 筆', fc:4, fixed:{start:30001,count:6} });
+  }
+  return ops;
+}
+
+// ========= UI 綁定 =========
+const devSel   = document.getElementById('device');
+const opSel    = document.getElementById('operation');
+const fcView   = document.getElementById('fcView');
+const paramArea= document.getElementById('param-area');
+
+let CURRENT = AC; // 預設空調
+let OPS = buildOps(CURRENT);
+
+function refreshOps(){
+  opSel.innerHTML='';
+  OPS.forEach(o=>{ const opt=document.createElement('option'); opt.value=o.id; opt.textContent=o.name; opSel.appendChild(opt); });
+  opSel.value = 'quick_on';
+  renderParams();
+}
+
+function renderParams(){
+  const op = OPS.find(x=>x.id===opSel.value);
+  fcView.value = '0x'+op.fc.toString(16).toUpperCase().padStart(2,'0');
+  paramArea.innerHTML='';
+  const params = op.params || [];
+  params.forEach(p=>{
+    const wrap = document.createElement('div'); wrap.style.marginBottom='10px';
+    const lab = document.createElement('label'); lab.textContent=p.label; wrap.appendChild(lab);
+    let el;
+    if(p.type==='select'){
+      el = document.createElement('select');
+      p.options.forEach(opt=>{ const o=document.createElement('option'); o.value=opt.value; o.textContent=opt.label; el.appendChild(o); });
+    }else{ // number
+      el = document.createElement('input'); el.type='number'; if(p.min!==undefined) el.min=p.min; if(p.max!==undefined) el.max=p.max; if(p.value!==undefined) el.value=p.value;
+    }
+    el.id='param_'+p.key; wrap.appendChild(el); paramArea.appendChild(wrap);
+  });
+  if(op.id==='write_reg'){
+    const regSel=document.getElementById('param_reg');
+    buildRegValueInput(CURRENT.REG_ENUMS, +regSel.value);
+    regSel.addEventListener('change', ()=>buildRegValueInput(CURRENT.REG_ENUMS, +regSel.value));
+  }
+}
+
+function buildRegValueInput(enumTable, reg){
+  const def = enumTable[reg];
+  let holder = document.getElementById('param_val')?.parentElement; // 先找既有
+  if(!holder){
+    holder = document.createElement('div'); holder.style.marginBottom='10px';
+    const lab = document.createElement('label'); holder.appendChild(lab);
+    const anchor = document.createElement('div'); anchor.id='param_val_holder'; holder.appendChild(anchor);
+    paramArea.appendChild(holder);
+  }
+  holder.innerHTML='';
+  const lab=document.createElement('label'); lab.textContent = def?.label || '寫入值'; holder.appendChild(lab);
+  if(def?.map){
+    const sel=document.createElement('select'); sel.id='param_val';
+    Object.entries(def.map).forEach(([k,v])=>{ const o=document.createElement('option'); o.value=k; o.textContent=`${k} (${v})`; sel.appendChild(o); });
+    holder.appendChild(sel);
+  }else{
+    const inp=document.createElement('input'); inp.id='param_val'; inp.type='number';
+    if(def?.range){ inp.min=def.range[0]; inp.max=def.range[1]; inp.placeholder=`${def.range[0]}~${def.range[1]}`; }
+    holder.appendChild(inp);
+  }
+}
+
+devSel.addEventListener('change', ()=>{ CURRENT = (devSel.value==='aq') ? AQ : AC; OPS = buildOps(CURRENT); refreshOps(); });
+opSel.addEventListener('change', renderParams);
+refreshOps();
+
+// ========= 生成 ========
+function rtuMonBuild(){
+  const slaveInput = document.getElementById('slave');
+  const broadcast = document.getElementById('broadcast').checked;
+  const op = OPS.find(x=>x.id===opSel.value);
+  let slave = parseInt(slaveInput.value)||1;
+  if(broadcast && (op.fc===5 || op.fc===6)) slave = 0; // 僅寫入使用 broadcast
+
+  let pdu = [slave, op.fc];
+  let mon = '';
+
+  let start, count, coil, reg, val;
+  if(op.fixed){
+    if(op.fixed.start) start = op.fixed.start;
+    if(op.fixed.count) count = op.fixed.count;
+    if(op.fixed.reg!==undefined) reg = op.fixed.reg;
+    if(op.fixed.val!==undefined) val = op.fixed.val;
+  }
+  (op.params||[]).forEach(p=>{
+    const el = document.getElementById('param_'+p.key);
+    if(!el) return;
+    const num = (p.type==='select') ? parseInt(el.value) : parseInt(el.value||'0');
+    if(p.key==='start') start = num; if(p.key==='count') count = num; if(p.key==='coil') coil = num; if(p.key==='reg') reg = num; if(p.key==='val') val = num;
+  });
+
+  if(op.id==='quick_on' || op.id==='quick_off'){ coil = op.coil; val = op.val; }
+
+  if(op.fc===1){ // Read Coils
+    const s = rtuAddrFromHuman(start); pdu.push((s>>8)&0xFF, s&0xFF, (count>>8)&0xFF, count&0xFF);
+    const a = monAddrFromHuman(start).toString().padStart(6,'0'); mon = `${a}${count>1?`#${count}`:''}`;
+  } else if(op.fc===3){ // Read Holding
+    const s = rtuAddrFromHuman(start); pdu.push((s>>8)&0xFF, s&0xFF, (count>>8)&0xFF, count&0xFF);
+    const a = monAddrFromHuman(start).toString().padStart(6,'0'); mon = `${a}${count>1?`#${count}`:''}`;
+  } else if(op.fc===4){ // Read Input
+    const s = rtuAddrFromHuman(start); pdu.push((s>>8)&0xFF, s&0xFF, (count>>8)&0xFF, count&0xFF);
+    const a = monAddrFromHuman(start).toString().padStart(6,'0'); mon = `${a}${count>1?`#${count}`:''}`;
+  } else if(op.fc===5){ // Write Single Coil
+    const s = rtuAddrFromHuman(coil); pdu.push((s>>8)&0xFF, s&0xFF, val===1?0xFF:0x00, 0x00);
+    const a = monAddrFromHuman(coil).toString().padStart(6,'0'); mon = `${a}*${val}`;
+  } else if(op.fc===6){ // Write Single Register
+    const r = reg ?? start; const s = rtuAddrFromHuman(r); const w = val ?? 0;
+    pdu.push((s>>8)&0xFF, s&0xFF, (w>>8)&0xFF, w&0xFF);
+    const a = monAddrFromHuman(r).toString().padStart(6,'0'); mon = `${a}*${w}`;
+  }
+
+  const crc = crc16(pdu); pdu.push(crc & 0xFF, (crc>>8) & 0xFF);
+  const hex = pdu.map(toHex).join(' ');
+  document.getElementById('rtu').value = hex;
+  document.getElementById('mon').value = mon;
+}
+
+document.getElementById('gen').addEventListener('click', rtuMonBuild);
+
+// 點擊輸出框即可複製
+['rtu','mon'].forEach(id=>{
+  const el=document.getElementById(id);
+  el.addEventListener('click', ()=>{ const t=(el.value||'').trim(); if(!t) return; navigator.clipboard.writeText(t).then(()=>{ el.classList.add('copied'); setTimeout(()=>el.classList.remove('copied'),700);}); });
+});
+</script>
+</body>
+</html>
